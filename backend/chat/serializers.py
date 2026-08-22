@@ -96,6 +96,7 @@ class MessageSerializer(serializers.ModelSerializer):
         model = Message
         fields = [
             'id', 'role', 'content', 'timestamp', 'character', 'research_payload',
+            'thinking', 'tool_calls', 'token_usage',
             'file_uri', 'file_preview_url', 'file_name', 'file_type', 'file_mime_type', 'attachments',
         ]
         read_only_fields = ['timestamp']
@@ -139,9 +140,14 @@ class ModelConfigurationSerializer(serializers.ModelSerializer):
         model = ModelConfiguration
         fields = [
             'id', 'name', 'provider', 'model_name', 'api_key', 'base_url',
-            'created_at', 'updated_at'
+            'context_window', 'created_at', 'updated_at'
         ]
         read_only_fields = ['created_at', 'updated_at']
+
+    def validate_context_window(self, value):
+        if value is not None and value <= 0:
+            raise serializers.ValidationError('Context window must be a positive token count.')
+        return value
 
 
 class WebSearchConfigurationSerializer(serializers.ModelSerializer):
@@ -246,7 +252,7 @@ class ChatSessionSerializer(serializers.ModelSerializer):
         model = ChatSession
         fields = [
             'id', 'character', 'user', 'title', 'messages', 'created_at', 'updated_at',
-            'last_response_latency_ms', 'is_private_mode',
+            'last_response_latency_ms', 'is_private_mode', 'origin', 'is_title_manual',
         ]
         read_only_fields = ['created_at', 'updated_at']
 

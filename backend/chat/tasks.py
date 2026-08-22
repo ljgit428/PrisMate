@@ -17,6 +17,7 @@ from .attachments import (
     describe_attachment_for_prompt,
     get_message_attachments,
 )
+from .memory.filesystem import CharacterMemoryFilesystem
 from .memory.manager import MemoryManager
 from .memory.prompts import build_memory_extraction_prompt, get_memory_crud_tool_specs
 from .models import (
@@ -34,8 +35,6 @@ from .search import search_web
 from .soul import (
     build_character_prompt_context,
     build_memory_explorer_manifest,
-    list_memory_explorer_path,
-    read_memory_explorer_file,
 )
 
 logger = logging.getLogger(__name__)
@@ -865,6 +864,63 @@ def _build_provider_message_entry(message, runtime_config, role_configs):
     }
 
 
+def _extract_token_usage(usage_payload):
+    """Normalize an OpenAI-compatible ``usage`` dict into the token_usage
+    shape stored on Message. Returns ``None`` when nothing usable is present.
+
+    Cached-token field names differ per vendor: OpenAI/GLM put it in
+    ``prompt_tokens_details.cached_tokens``, DeepSeek uses
+    ``prompt_cache_hit_tokens``; accept the common variants.
+    """
+    if not isinstance(usage_payload, dict):
+        return None
+
+    def _int(value):
+        if isinstance(value, bool):
+            return 0
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+        return None
+
+    prompt_tokens = _int(usage_payload.get('prompt_tokens'))
+    completion_tokens = _int(usage_payload.get('completion_tokens'))
+    total_tokens = _int(usage_payload.get('total_tokens'))
+    if prompt_tokens is None and completion_tokens is None and total_tokens is None:
+        return None
+
+    prompt_tokens = prompt_tokens or 0
+    completion_tokens = completion_tokens or 0
+    cached_tokens = None
+    details = usage_payload.get('prompt_tokens_details')
+    if isinstance(details, dict):
+        cached_tokens = _int(details.get('cached_tokens'))
+    if cached_tokens is None:
+        cached_tokens = _int(usage_payload.get('cached_tokens'))
+    if cached_tokens is None:
+        cached_tokens = _int(usage_payload.get('prompt_cache_hit_tokens'))
+
+    return {
+        'prompt_tokens': prompt_tokens,
+        'completion_tokens': completion_tokens,
+        'total_tokens': total_tokens if total_tokens is not None else prompt_tokens + completion_tokens,
+        'cached_tokens': min(cached_tokens or 0, prompt_tokens),
+    }
+
+
+def _merge_token_usage(accumulated, usage):
+    """Sum usage dicts across multi-round tool loops (None starts a fresh total)."""
+    if not usage:
+        return accumulated
+    if not accumulated:
+        return dict(usage)
+    return {
+        key: accumulated.get(key, 0) + usage.get(key, 0)
+        for key in ('prompt_tokens', 'completion_tokens', 'total_tokens', 'cached_tokens')
+    }
+
+
 def _request_openai_compatible_completion(
     *,
     model_name,
@@ -892,23 +948,21 @@ def _request_openai_compatible_completion(
     return response.json()
 
 
-def _execute_local_memory_tool(character, tool_name, raw_arguments):
+def _execute_local_memory_tool(filesystem, tool_name, raw_arguments):
     try:
         arguments = json.loads(raw_arguments or '{}')
     except json.JSONDecodeError:
         arguments = {}
 
     if tool_name == 'list_memory_files':
-        return list_memory_explorer_path(
-            character,
+        return filesystem.list_memory_files(
             path_prefix=arguments.get('path_prefix', ''),
             recursive=bool(arguments.get('recursive', False)),
             max_entries=arguments.get('max_entries', 40),
         )
 
     if tool_name == 'read_memory_file':
-        return read_memory_explorer_file(
-            character,
+        return filesystem.read_memory_file(
             path=arguments.get('path', ''),
             max_chars=arguments.get('max_chars', MEMORY_TOOL_DEFAULT_MAX_CHARS),
         )
@@ -918,17 +972,27 @@ def _execute_local_memory_tool(character, tool_name, raw_arguments):
     }
 
 
-def _generate_openai_compatible_response(model_name, api_key, messages, base_url, tools=None, character=None):
-    if not tools:
-        return _extract_openai_content(
-            _request_openai_compatible_completion(
-                model_name=model_name,
-                api_key=api_key,
-                messages=messages,
-                base_url=base_url,
-            )
-        )
+def _generate_openai_compatible_response(model_name, api_key, messages, base_url, tools=None, filesystem=None, event_sink=None):
+    """Run the OpenAI-compatible tool loop and return the final text.
 
+    When ``event_sink`` (a list) is provided, tool calls and the final round's
+    native reasoning text are appended to it as ``{'type': 'tool' | 'thinking', ...}``
+    dicts so callers can surface them to the user without extra LLM calls.
+    """
+    if not tools:
+        response_json = _request_openai_compatible_completion(
+            model_name=model_name,
+            api_key=api_key,
+            messages=messages,
+            base_url=base_url,
+        )
+        if event_sink is not None:
+            usage = _extract_token_usage(response_json.get('usage'))
+            if usage:
+                event_sink.append({'type': 'usage', 'usage': usage})
+        return _extract_openai_content(response_json)
+
+    usage_total = None
     history = list(messages)
     for _ in range(OPENAI_LOCAL_TOOL_CALL_LIMIT):
         try:
@@ -945,15 +1009,21 @@ def _generate_openai_compatible_response(model_name, api_key, messages, base_url
                     "OpenAI-compatible backend rejected local memory tools for model %s; retrying without tools.",
                     model_name,
                 )
-                return _extract_openai_content(
-                    _request_openai_compatible_completion(
-                        model_name=model_name,
-                        api_key=api_key,
-                        messages=messages,
-                        base_url=base_url,
-                    )
+                if event_sink is not None:
+                    del event_sink[:]
+                response_json = _request_openai_compatible_completion(
+                    model_name=model_name,
+                    api_key=api_key,
+                    messages=messages,
+                    base_url=base_url,
                 )
+                if event_sink is not None:
+                    usage = _extract_token_usage(response_json.get('usage'))
+                    if usage:
+                        event_sink.append({'type': 'usage', 'usage': usage})
+                return _extract_openai_content(response_json)
             raise
+        usage_total = _merge_token_usage(usage_total, _extract_token_usage(response_json.get('usage')))
         assistant_message = _extract_openai_assistant_message(response_json)
         tool_calls = assistant_message.get('tool_calls') or []
         history.append({
@@ -965,18 +1035,31 @@ def _generate_openai_compatible_response(model_name, api_key, messages, base_url
         if not tool_calls:
             content = _extract_text_from_content(assistant_message.get('content'))
             if content:
+                reasoning = assistant_message.get('reasoning_content') or assistant_message.get('reasoning')
+                if reasoning and event_sink is not None:
+                    event_sink.append({'type': 'thinking', 'content': reasoning})
+                if event_sink is not None and usage_total:
+                    event_sink.append({'type': 'usage', 'usage': dict(usage_total)})
                 return content
             raise ValueError('OpenAI compatible API returned an empty response after tool execution')
 
-        if character is None:
-            raise ValueError('Local tool execution requires a character context')
+        if filesystem is None:
+            raise ValueError('Local tool execution requires a memory filesystem context')
 
         for tool_call in tool_calls:
             function_payload = tool_call.get('function') or {}
+            tool_name = function_payload.get('name', '')
+            raw_arguments = function_payload.get('arguments', '{}')
+            try:
+                tool_arguments = json.loads(raw_arguments or '{}')
+            except json.JSONDecodeError:
+                tool_arguments = {}
+            if event_sink is not None:
+                event_sink.append({'type': 'tool', 'tool': tool_name, 'arguments': tool_arguments})
             tool_result = _execute_local_memory_tool(
-                character,
-                tool_name=function_payload.get('name', ''),
-                raw_arguments=function_payload.get('arguments', '{}'),
+                filesystem,
+                tool_name=tool_name,
+                raw_arguments=raw_arguments,
             )
             history.append({
                 'role': 'tool',
@@ -993,17 +1076,29 @@ def _stream_openai_compatible_response(model_name, api_key, messages, base_url):
     if api_key:
         headers['Authorization'] = f'Bearer {api_key}'
 
-    with requests.post(
-        _build_openai_endpoint(base_url),
-        headers=headers,
-        json={
+    def _open_stream(include_usage):
+        payload = {
             'model': model_name,
             'messages': messages,
             'stream': True,
-        },
-        stream=True,
-        timeout=90,
-    ) as response:
+        }
+        if include_usage:
+            payload['stream_options'] = {'include_usage': True}
+        return requests.post(
+            _build_openai_endpoint(base_url),
+            headers=headers,
+            json=payload,
+            stream=True,
+            timeout=90,
+        )
+
+    response = _open_stream(include_usage=True)
+    if response.status_code == 400:
+        # Older gateways reject unknown body params; retry without the flag —
+        # many vendors still attach usage to the final chunk by default.
+        response.close()
+        response = _open_stream(include_usage=False)
+    try:
         response.raise_for_status()
 
         for raw_line in response.iter_lines(decode_unicode=True):
@@ -1018,29 +1113,48 @@ def _stream_openai_compatible_response(model_name, api_key, messages, base_url):
                 break
 
             data = json.loads(line)
+
+            # The usage chunk (when requested via stream_options) carries an
+            # empty choices array, so parse it before the choices guard below.
+            usage = _extract_token_usage(data.get('usage'))
+            if usage:
+                yield {'type': 'usage', 'usage': usage}
+
             choices = data.get('choices') or []
             if not choices:
                 continue
 
             delta = choices[0].get('delta') or {}
+
+            # DeepSeek-style reasoning_content / OpenAI o-series reasoning.
+            # Surfaced verbatim as a thinking event: no extra LLM call needed.
+            reasoning = delta.get('reasoning_content') or delta.get('reasoning')
+            if isinstance(reasoning, str) and reasoning:
+                yield {'type': 'thinking', 'content': reasoning}
+                continue
+
             content = delta.get('content')
 
             if isinstance(content, str) and content:
-                yield content
+                yield {'type': 'delta', 'content': content}
                 continue
 
             text = _extract_text_from_content(content)
             if text:
-                yield text
+                yield {'type': 'delta', 'content': text}
+    finally:
+        response.close()
 
 
 def _iter_buffered_chunks(text, chunk_size=160):
+    """Re-stream buffered text as ``{'type': 'delta', ...}`` events so the
+    buffered tools path matches the streaming providers' event contract."""
     normalized = (text or '').strip()
     if not normalized:
         return
 
     for start_index in range(0, len(normalized), chunk_size):
-        yield normalized[start_index:start_index + chunk_size]
+        yield {'type': 'delta', 'content': normalized[start_index:start_index + chunk_size]}
 
 
 # ---------------------------------------------------------------------------
@@ -1187,7 +1301,13 @@ def _request_anthropic_completion(*, model_name, api_key, messages, base_url, to
     return response.json()
 
 
-def _generate_anthropic_response(model_name, api_key, messages, base_url, tools=None, character=None):
+def _generate_anthropic_response(model_name, api_key, messages, base_url, tools=None, filesystem=None, event_sink=None):
+    """Run the Anthropic tool loop and return the final text.
+
+    When ``event_sink`` (a list) is provided, tool calls and the final round's
+    ``thinking`` blocks are appended as ``{'type': 'tool' | 'thinking', ...}``
+    dicts for surfacing in the UI.
+    """
     if not tools:
         return _extract_anthropic_text(
             _request_anthropic_completion(
@@ -1218,18 +1338,30 @@ def _generate_anthropic_response(model_name, api_key, messages, base_url, tools=
         if not tool_use_blocks:
             text = _extract_anthropic_text(response_json)
             if text:
+                if event_sink is not None:
+                    thinking_text = '\n\n'.join(
+                        block.get('thinking', '')
+                        for block in content_blocks
+                        if block.get('type') == 'thinking' and block.get('thinking')
+                    ).strip()
+                    if thinking_text:
+                        event_sink.append({'type': 'thinking', 'content': thinking_text})
                 return text
             raise ValueError('Anthropic API returned an empty response after tool execution')
 
-        if character is None:
-            raise ValueError('Local tool execution requires a character context')
+        if filesystem is None:
+            raise ValueError('Local tool execution requires a memory filesystem context')
 
         tool_result_blocks = []
         for block in tool_use_blocks:
+            tool_name = block.get('name', '')
+            tool_arguments = block.get('input') or {}
+            if event_sink is not None:
+                event_sink.append({'type': 'tool', 'tool': tool_name, 'arguments': tool_arguments})
             tool_result = _execute_local_memory_tool(
-                character,
-                tool_name=block.get('name', ''),
-                raw_arguments=json.dumps(block.get('input') or {}, ensure_ascii=False),
+                filesystem,
+                tool_name=tool_name,
+                raw_arguments=json.dumps(tool_arguments, ensure_ascii=False),
             )
             tool_result_blocks.append({
                 'type': 'tool_result',
@@ -1282,7 +1414,10 @@ def _stream_anthropic_response(model_name, api_key, messages, base_url):
                 continue
             delta = event.get('delta') or {}
             if delta.get('type') == 'text_delta' and delta.get('text'):
-                yield delta['text']
+                yield {'type': 'delta', 'content': delta['text']}
+            elif delta.get('type') == 'thinking_delta' and delta.get('thinking'):
+                # Anthropic extended thinking: streamed verbatim as a thinking event.
+                yield {'type': 'thinking', 'content': delta['thinking']}
 
 
 def _stream_gemini_response(model_name, api_key, prompt_or_messages, tools=None):
@@ -1294,12 +1429,33 @@ def _stream_gemini_response(model_name, api_key, prompt_or_messages, tools=None)
     response = model.generate_content(prompt_or_messages, stream=True)
 
     for chunk in response:
-        text = getattr(chunk, 'text', '')
+        parts = getattr(chunk, 'parts', None)
+        if parts:
+            for part in parts:
+                text = getattr(part, 'text', '') or ''
+                if not text:
+                    continue
+                if getattr(part, 'thought', False):
+                    # Gemini 2.5-style thinking parts: surfaced as a thinking event.
+                    yield {'type': 'thinking', 'content': text}
+                else:
+                    yield {'type': 'delta', 'content': text}
+            continue
+
+        text = getattr(chunk, 'text', '') or ''
         if text:
-            yield text
+            yield {'type': 'delta', 'content': text}
 
 
-def _iter_text_chunks(runtime_config, prompt_or_messages, tools=None, character=None):
+def _iter_text_chunks(runtime_config, prompt_or_messages, tools=None, filesystem=None):
+    """Yield stream events as dicts: ``{'type': 'delta', 'content': ...}``,
+    ``{'type': 'thinking', 'content': ...}`` or
+    ``{'type': 'tool', 'tool': ..., 'arguments': ...}``.
+
+    Tool calls force buffered generation (the loop must complete before the
+    final text exists); tool/thinking events are emitted first, then the text
+    is re-streamed in chunks so the UI still feels live.
+    """
     provider = runtime_config['provider']
     model_name = runtime_config['model_name']
     api_key = runtime_config['api_key']
@@ -1312,14 +1468,17 @@ def _iter_text_chunks(runtime_config, prompt_or_messages, tools=None, character=
         if not isinstance(prompt_or_messages, list):
             prompt_or_messages = [{'role': 'user', 'content': str(prompt_or_messages)}]
         if tools:
+            event_sink: list[dict] = []
             buffered_text = _generate_openai_compatible_response(
                 model_name=model_name,
                 api_key=api_key,
                 messages=prompt_or_messages,
                 base_url=runtime_config.get('base_url', ''),
                 tools=tools,
-                character=character,
+                filesystem=filesystem,
+                event_sink=event_sink,
             )
+            yield from event_sink
             yield from _iter_buffered_chunks(buffered_text)
             return
         yield from _stream_openai_compatible_response(
@@ -1334,14 +1493,17 @@ def _iter_text_chunks(runtime_config, prompt_or_messages, tools=None, character=
         if not isinstance(prompt_or_messages, list):
             prompt_or_messages = [{'role': 'user', 'content': str(prompt_or_messages)}]
         if tools:
+            event_sink = []
             buffered_text = _generate_anthropic_response(
                 model_name=model_name,
                 api_key=api_key,
                 messages=prompt_or_messages,
                 base_url=runtime_config.get('base_url', ''),
                 tools=tools,
-                character=character,
+                filesystem=filesystem,
+                event_sink=event_sink,
             )
+            yield from event_sink
             yield from _iter_buffered_chunks(buffered_text)
             return
         yield from _stream_anthropic_response(
@@ -1355,7 +1517,7 @@ def _iter_text_chunks(runtime_config, prompt_or_messages, tools=None, character=
     raise ValueError(f"Unsupported model provider: {provider}")
 
 
-def _generate_text(runtime_config, prompt_or_messages, tools=None, character=None):
+def _generate_text(runtime_config, prompt_or_messages, tools=None, filesystem=None):
     provider = runtime_config['provider']
     model_name = runtime_config['model_name']
     api_key = runtime_config['api_key']
@@ -1378,7 +1540,7 @@ def _generate_text(runtime_config, prompt_or_messages, tools=None, character=Non
             messages=prompt_or_messages,
             base_url=runtime_config.get('base_url', ''),
             tools=tools,
-            character=character,
+            filesystem=filesystem,
         )
 
     if provider == 'anthropic':
@@ -1390,7 +1552,7 @@ def _generate_text(runtime_config, prompt_or_messages, tools=None, character=Non
             messages=prompt_or_messages,
             base_url=runtime_config.get('base_url', ''),
             tools=tools,
-            character=character,
+            filesystem=filesystem,
         )
 
     raise ValueError(f"Unsupported model provider: {provider}")
@@ -1932,6 +2094,36 @@ def _build_provider_messages(
     return runtime_config, formatted_history, tools
 
 
+def _prepare_generation(chat_session, character, generate_greeting=False, research_context=None):
+    """Shared generation configuration for the streaming and non-streaming paths.
+
+    The memory strategy is decided exactly once here and used by both paths so
+    they never drift apart: providers that support local tools get the memory
+    tooling mode, everyone else falls back to a compact prefetch injected into
+    the prompt (``_build_stream_memory_prefetch`` is used by both paths even
+    though its name predates that). Returns ``(runtime_config,
+    formatted_history, tools)``.
+    """
+    runtime_config = _get_runtime_model_config(chat_session)
+    use_memory_tools = _supports_memory_tool_mode(runtime_config)
+    retrieved_memory = ''
+    if not use_memory_tools:
+        retrieved_memory = _build_stream_memory_prefetch(
+            character,
+            chat_session,
+            generate_greeting=generate_greeting,
+        )
+    runtime_config, formatted_history, tools = _build_provider_messages(
+        chat_session=chat_session,
+        character=character,
+        generate_greeting=generate_greeting,
+        research_context=research_context,
+        allow_memory_tools=use_memory_tools,
+        retrieved_memory=retrieved_memory,
+    )
+    return runtime_config, formatted_history, tools
+
+
 # ---------------------------------------------------------------------------
 # Long-term memory pipeline (per-turn, SonettoHere parity)
 # ---------------------------------------------------------------------------
@@ -2215,7 +2407,16 @@ def sync_long_term_memory(self, message_id, chat_session_id, character_id):
 
 
 @shared_task(retry_backoff=True)
-def update_session_title(chat_session, history_text, runtime_config):
+def update_session_title(chat_session_id, history_text, runtime_config):
+    try:
+        chat_session = ChatSession.objects.get(id=chat_session_id)
+    except ChatSession.DoesNotExist:
+        return
+
+    # A user-renamed title must never be overwritten by the generator.
+    if chat_session.is_title_manual:
+        return
+
     try:
         prompt = (
             "Analyze the following short conversation start.\n"
@@ -2233,7 +2434,33 @@ def update_session_title(chat_session, history_text, runtime_config):
             chat_session.title = new_title[:200]
             chat_session.save(update_fields=['title'])
     except Exception as exc:
-        logger.error("Failed to auto-generate title for session %s: %s", chat_session.id, exc)
+        logger.error("Failed to auto-generate title for session %s: %s", chat_session_id, exc)
+
+
+def _dispatch_session_title_update(chat_session, history_text, runtime_config):
+    """Enqueue the title LLM call so it never blocks the streamed reply.
+
+    Falls back to an inline call when no broker is reachable (dev without
+    Redis keeps working, just synchronously)."""
+    config_payload = {
+        'provider': runtime_config.get('provider'),
+        'model_name': runtime_config.get('model_name'),
+        'api_key': runtime_config.get('api_key'),
+        'base_url': runtime_config.get('base_url', ''),
+    }
+    try:
+        update_session_title.delay(chat_session.id, history_text, config_payload)
+        return
+    except Exception as exc:
+        logger.warning(
+            'Failed to enqueue title update for session %s; running inline: %s',
+            chat_session.id, exc,
+        )
+
+    try:
+        update_session_title(chat_session.id, history_text, config_payload)
+    except Exception as exc:
+        logger.error('Failed to auto-generate title for session %s: %s', chat_session.id, exc)
 
 
 def _build_research_payload(chat_session, research_context):
@@ -2253,6 +2480,9 @@ def _finalize_ai_response(
     user_message=None,
     latency_ms=None,
     research_context=None,
+    thinking='',
+    tool_calls=None,
+    token_usage=None,
 ):
     ai_message = Message.objects.create(
         chat_session=chat_session,
@@ -2260,6 +2490,9 @@ def _finalize_ai_response(
         content=ai_response_text,
         character=character,
         research_payload={},
+        thinking=thinking or '',
+        tool_calls=tool_calls or [],
+        token_usage=token_usage or {},
     )
 
     update_fields = ['updated_at']
@@ -2268,15 +2501,19 @@ def _finalize_ai_response(
         update_fields.append('last_response_latency_ms')
     chat_session.save(update_fields=update_fields)
 
-    if user_message is not None:
-        visible_history_count = len(_get_visible_history_messages(chat_session))
+    if user_message is not None and not chat_session.is_title_manual:
+        # Name the topic exactly once: while the title is still the default,
+        # generated from the full conversation opening (greeting + first user
+        # turn + first reply). A successful run — or a manual rename — freezes
+        # it; a failed run leaves the default title so the next turn retries.
         is_default_title = chat_session.title.startswith("Chat with ")
-        if is_default_title or visible_history_count <= 4:
-            conversation_text_for_title = (
-                f"User: {_build_user_turn_summary(user_message, include_text_body=False)}\n"
-                f"Character: {ai_response_text[:200]}"
+        if is_default_title:
+            history_messages = _get_visible_history_messages(chat_session)
+            conversation_text_for_title = '\n'.join(
+                f"{'User' if message.role == 'user' else 'Character'}: {(message.content or '')[:200]}"
+                for message in history_messages[-6:]
             )
-            update_session_title(chat_session, conversation_text_for_title, runtime_config)
+            _dispatch_session_title_update(chat_session, conversation_text_for_title, runtime_config)
 
     research_payload = _build_research_payload(chat_session, research_context or {})
     ai_message.research_payload = research_payload
@@ -2307,7 +2544,7 @@ def generate_ai_response(message_id, character_id, generate_greeting=False, chat
         if chat_session is None:
             raise ValueError('Chat session not found for response generation')
         research_context = build_research_context(chat_session, user_message=user_message)
-        runtime_config, formatted_history, tools = _build_provider_messages(
+        runtime_config, formatted_history, tools = _prepare_generation(
             chat_session=chat_session,
             character=character,
             generate_greeting=generate_greeting,
@@ -2315,7 +2552,12 @@ def generate_ai_response(message_id, character_id, generate_greeting=False, chat
         )
 
         started_at = time.perf_counter()
-        ai_response_text = _generate_text(runtime_config, formatted_history, tools=tools, character=character)
+        ai_response_text = _generate_text(
+            runtime_config,
+            formatted_history,
+            tools=tools,
+            filesystem=CharacterMemoryFilesystem(character),
+        )
         latency_ms = int((time.perf_counter() - started_at) * 1000)
         ai_message = _finalize_ai_response(
             chat_session=chat_session,
@@ -2341,29 +2583,64 @@ def generate_ai_response(message_id, character_id, generate_greeting=False, chat
 
 
 def stream_ai_response(chat_session, character, user_message=None, generate_greeting=False):
+    # Surface web search as a tool line before the search HTTP call starts.
+    collected_tool_calls = []
+    profile = _get_user_profile(chat_session)
+    if profile.default_enable_web_search:
+        search_query = _build_search_query(chat_session, user_message=user_message)
+        if search_query:
+            search_arguments = {'query': search_query}
+            collected_tool_calls.append({'tool': 'web_search', 'arguments': search_arguments})
+            yield {'type': 'tool', 'tool': 'web_search', 'arguments': search_arguments}
+
     research_context = build_research_context(chat_session, user_message=user_message)
-    retrieved_memory = _build_stream_memory_prefetch(
-        character,
-        chat_session,
-        generate_greeting=generate_greeting,
-    )
-    runtime_config, formatted_history, tools = _build_provider_messages(
+
+    # Shared generation configuration: memory strategy (tools vs prefetch),
+    # prompt building and tool specs are decided once in _prepare_generation
+    # so the streaming and non-streaming paths can never drift apart.
+    runtime_config, formatted_history, tools = _prepare_generation(
         chat_session=chat_session,
         character=character,
         generate_greeting=generate_greeting,
         research_context=research_context,
-        allow_memory_tools=False,
-        retrieved_memory=retrieved_memory,
     )
 
     started_at = time.perf_counter()
     collected_chunks = []
+    collected_thinking = []
+    collected_usage = None
 
-    for chunk in _iter_text_chunks(runtime_config, formatted_history, tools=tools, character=character):
-        if not chunk:
+    for event in _iter_text_chunks(
+        runtime_config,
+        formatted_history,
+        tools=tools,
+        filesystem=CharacterMemoryFilesystem(character),
+    ):
+        event_type = event.get('type')
+        if event_type == 'usage':
+            # Internal bookkeeping event; folded into the done payload below.
+            collected_usage = _merge_token_usage(collected_usage, event.get('usage'))
             continue
-        collected_chunks.append(chunk)
-        yield {'type': 'delta', 'content': chunk}
+        if event_type == 'delta':
+            content = event.get('content') or ''
+            if not content:
+                continue
+            collected_chunks.append(content)
+            yield {'type': 'delta', 'content': content}
+            continue
+        if event_type == 'thinking':
+            content = event.get('content') or ''
+            if not content:
+                continue
+            collected_thinking.append(content)
+            yield {'type': 'thinking', 'content': content}
+            continue
+        if event_type == 'tool':
+            tool_name = event.get('tool') or ''
+            tool_arguments = event.get('arguments') or {}
+            collected_tool_calls.append({'tool': tool_name, 'arguments': tool_arguments})
+            yield {'type': 'tool', 'tool': tool_name, 'arguments': tool_arguments}
+            continue
 
     ai_response_text = ''.join(collected_chunks).strip()
     latency_ms = int((time.perf_counter() - started_at) * 1000)
@@ -2379,6 +2656,9 @@ def stream_ai_response(chat_session, character, user_message=None, generate_gree
         user_message=user_message,
         latency_ms=latency_ms,
         research_context=research_context,
+        thinking=''.join(collected_thinking).strip(),
+        tool_calls=collected_tool_calls,
+        token_usage=collected_usage,
     )
 
     yield {
@@ -2390,4 +2670,7 @@ def stream_ai_response(chat_session, character, user_message=None, generate_gree
         'provider': runtime_config['provider'],
         'model_name': runtime_config['model_name'],
         'research_payload': ai_message.research_payload,
+        'thinking': ai_message.thinking,
+        'tool_calls': ai_message.tool_calls,
+        'token_usage': ai_message.token_usage,
     }

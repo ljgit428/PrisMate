@@ -147,3 +147,9 @@ logs/
 .env
 .env.local
 .env.*.local
+
+# Prototype / local tooling output
+profile_out/
+scripts/profile_out/
+reduce_out/
+scripts/reduce_out/

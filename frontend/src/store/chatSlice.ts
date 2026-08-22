@@ -1,5 +1,5 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit';
-import { ChatState, Message, Character, ChatSession } from '@/types';
+import { ChatState, Message, Character, ChatSession, ToolCallInfo } from '@/types';
 
 const initialState: ChatState = {
   messages: [],
@@ -31,6 +31,18 @@ const chatSlice = createSlice({
       const target = state.messages.find((message) => message.id === action.payload.id);
       if (target) {
         target.content += action.payload.content;
+      }
+    },
+    appendToMessageThinking: (state, action: PayloadAction<{ id: string; content: string }>) => {
+      const target = state.messages.find((message) => message.id === action.payload.id);
+      if (target) {
+        target.thinking = (target.thinking || '') + action.payload.content;
+      }
+    },
+    appendToMessageToolCall: (state, action: PayloadAction<{ id: string; toolCall: ToolCallInfo }>) => {
+      const target = state.messages.find((message) => message.id === action.payload.id);
+      if (target) {
+        target.toolCalls = [...(target.toolCalls || []), action.payload.toolCall];
       }
     },
     removeMessage: (state, action: PayloadAction<string>) => {
@@ -70,6 +82,8 @@ export const {
   addMessage,
   upsertMessage,
   appendToMessage,
+  appendToMessageThinking,
+  appendToMessageToolCall,
   removeMessage,
   setLoading,
   setError,

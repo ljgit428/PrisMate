@@ -57,6 +57,18 @@ export interface KnowledgeAsset {
   updatedAt: string;
 }
 
+export interface ToolCallInfo {
+  tool: string;
+  arguments?: Record<string, unknown>;
+}
+
+export interface TokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  cachedTokens: number;
+}
+
 export interface Message {
   id: string;
   content: string;
@@ -67,6 +79,9 @@ export interface Message {
   senderAvatarUrl?: string;
   senderType?: 'user' | 'character' | 'system';
   researchPayload?: ResearchPayload | null;
+  thinking?: string;
+  toolCalls?: ToolCallInfo[];
+  tokenUsage?: TokenUsage | null;
   attachments?: MessageAttachment[];
   fileUri?: string;
   fileName?: string;
@@ -120,6 +135,7 @@ export interface ModelConfig {
   modelName: string;
   apiKey: string;
   baseUrl?: string;
+  contextWindow?: number | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -177,6 +193,7 @@ export interface ChatSession {
   title: string;
   lastResponseLatencyMs?: number | null;
   isPrivateMode?: boolean;
+  origin?: string;
   character: Character;
   createdAt: string;
   updatedAt: string;

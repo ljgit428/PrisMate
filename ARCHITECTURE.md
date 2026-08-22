@@ -46,17 +46,32 @@
 ---
 
 ## 2. AI Character Generation (GraphQL / ETL)
-**Goal:** Extract structured persona from unstructured files (novels/PDFs).
+**Goal:** Extract structured persona from unstructured files (novels/PDFs/dialogue scripts).
 **Flow:**
-1. [UI] `CreateCharacterForm.tsx` (File Drop)
-   ↓ GraphQL Mutation (`GENERATE_DRAFT`)
-2. [Schema] `graphql/schema.py`
+1. [UI] `CreateCharacterSimplifiedForm.tsx` (File Drop) -> uploads land via `/api/upload`
+   ↓ GraphQL Mutation (`GENERATE_DRAFT`, fileUrls + textContext)
+2. [Schema] `graphql/schema.py` (`generateCharacterDraft`)
+   ↓ `_resolve_staged_uploads()` — resolve uploaded URLs to in-memory records
+   (text content extracted; images carry URL/metadata only)
    ↓
-3. [ETL] **Gemini 2.5 Flash** (Prompt: "Extract JSON")
+   **Branch A — small batches (< 12 text files): Memory Tools ReAct loop**
+   - Files are NOT inlined into the prompt. The model calls `list_memory_files` /
+     `read_memory_file` (backed by `StagedUploadMemoryFilesystem`) and reads only
+     what it needs. Providers: OpenAI-compatible / Anthropic (Gemini falls back
+     to local text reads).
    ↓
-4. [Parser] JSON Response -> GraphQL Object
+   **Branch B — large batches (>= 12 text files): reduce pipeline**
+   `chat/character_reduce.py` `run_reduce_pipeline()`:
+   1. Tier files by target-character line count (rules, 0 LLM): main/mid/cameo
+   2. Batch close-read: main in full, cameo as ±3-line segments
+   3. Per-batch LLM -> structured notes (personality evidence / language style /
+      behavior / emotion triggers / relationships) with source-file citations
+   4. Merge LLM -> profile_summary + dialogue_library + behavior_samples + evolution
+   5. `reduce_result_to_draft()` maps the result onto the `PrisMateDraft` schema
    ↓
-5. [UI] Auto-fill React Form Fields
+3. [Parser] JSON Response -> GraphQL Object (`PrisMateDraft`)
+   ↓
+4. [UI] Auto-fill React Form Fields
 
 ---
 

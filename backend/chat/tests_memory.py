@@ -64,7 +64,7 @@ class CharacterMemoryModelTests(TestCase):
         self.assertEqual(item.section, 'identity')
 
         rows = list(
-            MemoryAuditLog.objects.filter(character=self.character).order_by('created_at')
+            MemoryAuditLog.objects.filter(character=self.character).order_by('created_at', 'id')
         )
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].action, MemoryAuditAction.CREATE)
@@ -111,7 +111,7 @@ class CharacterMemoryModelTests(TestCase):
         self.assertEqual(history_entry['new_desc'], 'Uses Clojure at work.')
         self.assertEqual(history_entry['reason'], 'Refined wording.')
 
-        audit_rows = list(MemoryAuditLog.objects.filter(character=self.character).order_by('created_at'))
+        audit_rows = list(MemoryAuditLog.objects.filter(character=self.character).order_by('created_at', 'id'))
         self.assertEqual([row.action for row in audit_rows], [MemoryAuditAction.CREATE, MemoryAuditAction.UPDATE])
         update_row = audit_rows[-1]
         self.assertEqual(update_row.before_description, 'Writes in Clojure.')
@@ -138,7 +138,7 @@ class CharacterMemoryModelTests(TestCase):
         self.assertFalse(CharacterMemoryItem.objects.filter(short_id=secondary.short_id).exists())
 
         actions = list(
-            self.character.memory_audit_log.order_by('created_at').values_list('action', flat=True)
+            self.character.memory_audit_log.order_by('created_at', 'id').values_list('action', flat=True)
         )
         self.assertEqual(actions, ['create', 'create', 'merge'])
 
@@ -263,7 +263,7 @@ class CharacterMemoryRestTests(TestCase):
                 data=json.dumps({'section': 'taste', 'description': desc}),
                 content_type='application/json',
             )
-        ids = [item.short_id for item in self.character.memory_items.order_by('created_at')]
+        ids = [item.short_id for item in self.character.memory_items.order_by('created_at', 'id')]
         self.assertEqual(len(ids), 2)
         response = self.client.post(
             f'/api/characters/{self.character.id}/memory/merge/',
@@ -509,7 +509,7 @@ class SyncLongTermMemoryTaskTests(TestCase):
         self.assertEqual(items[0].section, 'identity')
         self.assertEqual(items[0].description, 'Prefers warm drinks.')
 
-        rows = list(MemoryAuditLog.objects.filter(character=self.character).order_by('created_at'))
+        rows = list(MemoryAuditLog.objects.filter(character=self.character).order_by('created_at', 'id'))
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].action, MemoryAuditAction.CREATE)
         self.assertEqual(rows[0].source, MemoryAuditSource.CELERY_WORKER)

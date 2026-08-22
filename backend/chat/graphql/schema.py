@@ -4,6 +4,7 @@ from asgiref.sync import sync_to_async
 from django.conf import settings
 from django.contrib.auth.models import AnonymousUser
 from django.core.files import File
+import json
 import logging
 import mimetypes
 import os
@@ -11,8 +12,15 @@ from urllib.parse import urlparse, unquote
 
 from .types import CharacterType, ChatSessionType, CharacterInput, PrisMateDraft
 from chat.attachments import extract_text_attachment_content, guess_attachment_kind, validate_attachment_size
+from chat.character_reduce import _normalize_target_name, reduce_result_to_draft, run_reduce_pipeline
+from chat.memory.filesystem import StagedUploadMemoryFilesystem
 from chat.models import AttachmentKind, Character, CharacterKnowledgeAsset, ChatSession, ModelConfiguration, ModelRole, ModelRoleAssignment, UserProfile
-from chat.tasks import _extract_json_object, _generate_text
+from chat.tasks import (
+    _build_memory_tool_specs,
+    _extract_json_object,
+    _generate_text,
+    _supports_memory_tool_mode,
+)
 
 logger = logging.getLogger(__name__)
 SUPPORTED_BACKGROUND_TEXT_EXTENSIONS = {'.txt', '.md', '.markdown', '.json'}
@@ -93,6 +101,10 @@ def _get_draft_prompt_locale(user, locale: Optional[str] = None) -> str:
 
 DRAFT_PER_FILE_CHAR_LIMIT = 8000
 DRAFT_TOTAL_CHAR_LIMIT = 24000
+
+# 参考文件数达到该阈值时，草稿生成走 reduce 流水线（分层精读 → 笔记 → 合并）
+# 而不是单次 Memory Tools ReAct loop。
+REDUCE_PIPELINE_MIN_FILES = 12
 
 
 def _truncate_draft_contents(file_contents: List[str]) -> tuple[List[str], int]:
@@ -243,27 +255,118 @@ def _read_local_text_file(file_url: Optional[str]) -> str:
         return ""
 
 
-def _read_local_text_files(file_urls: Optional[List[str]]) -> List[str]:
-    """Read each uploaded text file's full content.
-
-    Length truncation happens later in `_truncate_draft_contents`, so this stays
-    simple and is safe to call from other code paths.
-    """
+def _resolve_staged_uploads(file_urls: Optional[List[str]]) -> List[dict]:
+    """Resolve the just-uploaded file URLs into the staged-upload records that
+    the draft Memory Tools browse. Text files carry their extracted content;
+    images carry only their URL/metadata (they cannot be read as text)."""
     if not file_urls:
         return []
 
-    contents = []
+    uploads = []
     seen_urls = set()
     for file_url in file_urls:
         if not file_url or file_url in seen_urls:
             continue
         seen_urls.add(file_url)
 
-        file_content = _read_local_text_file(file_url)
-        if file_content:
-            contents.append(file_content)
+        file_path = _resolve_local_media_path(file_url)
+        if not file_path:
+            continue
 
-    return contents
+        name = os.path.basename(file_path)
+        mime_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+        if _is_supported_background_text_path(file_path):
+            uploads.append({
+                "name": name,
+                "kind": AttachmentKind.TEXT,
+                "mime_type": mime_type,
+                "content": _read_local_text_file(file_url),
+                "file_url": file_url,
+            })
+        elif mime_type.startswith("image/"):
+            uploads.append({
+                "name": name,
+                "kind": AttachmentKind.IMAGE,
+                "mime_type": mime_type,
+                "content": "",
+                "file_url": file_url,
+            })
+
+    return uploads
+
+
+def _build_character_draft_tool_prompt(locale: str, text_context: Optional[str], upload_count: int) -> List[dict]:
+    """Build the system/user messages for the tool-driven character draft.
+
+    Unlike ``_build_character_draft_prompt``, uploaded file bodies are *not*
+    inlined here. The model must use ``list_memory_files`` / ``read_memory_file``
+    to read the files it actually needs.
+    """
+    if locale == "zh-CN":
+        system_prompt = (
+            "你是一名专业的角色设计师。\n"
+            "请分析提供的上下文，提取稳定的角色锚点和说话风格。\n\n"
+            f"用户上传了 {upload_count} 个参考文件，它们通过记忆文件系统暴露，"
+            "并不会出现在这条提示里。\n"
+            "必须使用工具按需查阅文件，而不是假设内容：\n"
+            "- 先用 list_memory_files 浏览上传文件（路径前缀 raw/character_setup/uploads）。\n"
+            "- 再用 read_memory_file 只读取与角色塑造相关的文件。\n"
+            "- 没有实际读取过的文件，不得声称知道其内容。\n\n"
+            "只返回原始 JSON 对象，不要使用 markdown，不要添加额外说明。JSON 必须包含这些键：\n"
+            "- name（字符串）：角色名\n"
+            "- description（字符串）：完整的背景与概述，至少 3 句话\n"
+            "- affiliation（字符串）：组织、阵营或所属\n"
+            "- personality（字符串）：1~2 句话概括角色的语气 / 性格 / 价值倾向，用于快速定调\n"
+            "- example_dialogue（字符串）：5 段不同的示例对话。每段格式必须是\n"
+            "  \"User: <一句提问或陈述>\\nCharacter: <一句完整回答>\"\n"
+            "- tags（字符串数组）：3 到 6 个关键词\n\n"
+            "要求：\n"
+            "- 优先直接从读取到的源材料提取；不要发明设定、场景、外貌、长篇 lore 总结。\n"
+            "- personality 要抓\"怎么说\"，而不是\"是谁\"。\n"
+            "- example_dialogue 的 5 段要覆盖：日常、提问、情绪、命令/拒绝、玩笑，每段回答不超过 2 句。\n"
+            "- 找不到线索时，对应字段返回空字符串（不要编造）。"
+        )
+        user_prompt = (
+            (f"[用户输入上下文]\n{text_context}" if text_context else "[用户输入上下文]\n（未提供额外上下文）")
+            + "\n\n请先用工具浏览并读取你需要的上传文件，然后输出角色草稿 JSON。"
+        )
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+    system_prompt = (
+        "You are an expert Character Designer.\n"
+        "Analyze the provided context to extract stable character anchors and a voice style.\n\n"
+        f"The user uploaded {upload_count} reference file(s). They are exposed through a memory "
+        "filesystem and are NOT included in this prompt.\n"
+        "You MUST use the tools to read files on demand instead of assuming their content:\n"
+        "- Call list_memory_files first to browse the uploaded files (path prefix raw/character_setup/uploads).\n"
+        "- Call read_memory_file to open only the files relevant to the character you are building.\n"
+        "- Never claim facts about a file you have not actually read.\n\n"
+        "Return ONLY a raw JSON object (no markdown formatting) with the following keys:\n"
+        "- name (string): Character name\n"
+        "- description (string): A comprehensive background and summary (at least 3 sentences)\n"
+        "- affiliation (string): Organization or faction\n"
+        "- personality (string): 1-2 sentences capturing the character's tone / demeanor / values for quick framing\n"
+        "- example_dialogue (string): Exactly 5 distinct example exchanges. Each MUST follow the format\n"
+        '  "User: <one short prompt or statement>\\nCharacter: <one reply of up to 2 sentences>"\n'
+        "- tags (list of strings): 3-6 keywords\n"
+        "\n"
+        "Rules:\n"
+        "- Prefer direct extraction from the source material you read; do NOT invent lore, appearance, scenario, or opening lines.\n"
+        "- personality should capture HOW the character speaks, not WHO they are.\n"
+        "- The 5 example_dialogue exchanges should cover: casual, a question, emotional, a refusal or command, and a joke.\n"
+        "- If a field has no signal, return an empty string (never fabricate)."
+    )
+    user_prompt = (
+        (f"[User Input Context]\n{text_context}" if text_context else "[User Input Context]\n(no extra context provided)")
+        + "\n\nBrowse and read the uploaded files you need via the tools, then output the character draft JSON."
+    )
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
 
 
 def _normalize_character_reference_inputs(input: CharacterInput):
@@ -286,25 +389,12 @@ def _normalize_character_reference_inputs(input: CharacterInput):
     return None
 
 
-def _attach_background_file_to_character(character, background_file_url: Optional[str], background_file_name: Optional[str] = None):
-    file_path = _resolve_local_media_path(background_file_url)
-    if not file_path:
-        return
-    if not _is_supported_background_text_path(file_path):
-        raise ValueError("Only TXT, Markdown, or JSON background files are supported.")
-
-    final_name = (background_file_name or os.path.basename(file_path)).strip() or os.path.basename(file_path)
-    with open(file_path, 'rb') as source_file:
-        character.file.save(final_name, File(source_file), save=False)
-
-
 def _attach_character_reference_assets(character, uploaded_assets, replace_existing=True):
     if uploaded_assets is None:
         return
 
     existing_assets = list(character.knowledge_assets.all()) if replace_existing else []
 
-    first_text_asset = None
     for index, uploaded_asset in enumerate(uploaded_assets):
         file_path = _resolve_local_media_path(uploaded_asset.get("uploaded_url"))
         if not file_path:
@@ -335,23 +425,9 @@ def _attach_character_reference_assets(character, uploaded_assets, replace_exist
             asset.file.save(file_name, django_file, save=False)
             asset.save()
 
-            if first_text_asset is None and attachment_kind == AttachmentKind.TEXT:
-                first_text_asset = asset
-
     for existing_asset in existing_assets:
         existing_asset.file.delete(save=False)
         existing_asset.delete()
-
-    if first_text_asset:
-        with first_text_asset.file.open('rb') as source_file:
-            character.file.save(
-                first_text_asset.attachment_name or os.path.basename(first_text_asset.file.name),
-                File(source_file),
-                save=False,
-            )
-    elif replace_existing and character.file:
-        character.file.delete(save=False)
-        character.file = None
 
 @strawberry.input
 class ChatSessionInput:
@@ -371,7 +447,12 @@ class Mutation:
     ) -> PrisMateDraft:
         """
         Calls the user's default model configuration to analyze text and return a structured Character Draft.
-        Handles local file reading for .txt/.md/.json files to support "Auto-Create" from text files.
+
+        Uploaded reference files are not inlined into the prompt. When the
+        runtime model supports tool calls (OpenAI-compatible / Anthropic),
+        the files are exposed through the ``list_memory_files`` /
+        ``read_memory_file`` tools so the model reads only what it needs.
+        Gemini falls back to reading text files locally.
         """
         user = await sync_to_async(_get_authenticated_user)(info)
 
@@ -384,15 +465,79 @@ class Mutation:
                 normalized_file_urls.extend(file_urls)
             if file_url:
                 normalized_file_urls.append(file_url)
-            raw_file_contents = _read_local_text_files(normalized_file_urls)
-            truncated_contents, dropped_tail_count = _truncate_draft_contents(raw_file_contents)
-            prompt = _build_character_draft_prompt(
-                draft_locale,
-                text_context,
-                truncated_contents,
-                dropped_tail_count=dropped_tail_count,
-            )
-            raw_text = await sync_to_async(_generate_text)(runtime_config, prompt)
+
+            staged_uploads = _resolve_staged_uploads(normalized_file_urls)
+
+            # 大量参考文件：走 reduce 流水线（分层精读 → 结构化笔记 → 合并），
+            # 避免单次 ReAct loop 无法覆盖全部文件。少量文件仍走 Memory Tools
+            # 按需读取，保证小批量响应速度。
+            text_uploads = [
+                upload for upload in staged_uploads
+                if upload.get("kind") == AttachmentKind.TEXT and upload.get("content")
+            ]
+            if len(text_uploads) >= REDUCE_PIPELINE_MIN_FILES:
+                target_name = _normalize_target_name(text_context)
+
+                def reduce_llm_call(system_prompt: str, user_prompt: str) -> str:
+                    messages = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ]
+                    raw = _generate_text(runtime_config, messages)
+                    data = _extract_json_object(raw)
+                    if not data:
+                        raise ValueError(
+                            "Model did not return a valid JSON object for the reduce step. "
+                            f"Raw model response preview: {(raw or '')[:300]!r}"
+                        )
+                    return json.dumps(data, ensure_ascii=False)
+
+                pipeline_result = await sync_to_async(run_reduce_pipeline)(
+                    text_uploads,
+                    target_name,
+                    llm_call=reduce_llm_call,
+                )
+                draft_data = reduce_result_to_draft(pipeline_result)
+                return PrisMateDraft(
+                    name=draft_data.get("name", "Unknown"),
+                    description=draft_data.get("description", ""),
+                    affiliation=draft_data.get("affiliation", ""),
+                    personality=draft_data.get("personality", ""),
+                    appearance=draft_data.get("appearance", ""),
+                    tags=draft_data.get("tags", []) or [],
+                    visual_summary=draft_data.get("visual_summary", ""),
+                    example_dialogue=(draft_data.get("example_dialogue") or "").strip(),
+                )
+
+            use_memory_tools = bool(staged_uploads) and _supports_memory_tool_mode(runtime_config)
+
+            if use_memory_tools:
+                filesystem = StagedUploadMemoryFilesystem(staged_uploads)
+                messages = _build_character_draft_tool_prompt(
+                    draft_locale,
+                    text_context,
+                    len(staged_uploads),
+                )
+                raw_text = await sync_to_async(_generate_text)(
+                    runtime_config,
+                    messages,
+                    tools=_build_memory_tool_specs(),
+                    filesystem=filesystem,
+                )
+            else:
+                raw_file_contents = [
+                    upload["content"]
+                    for upload in staged_uploads
+                    if upload["kind"] == AttachmentKind.TEXT and upload["content"]
+                ]
+                truncated_contents, dropped_tail_count = _truncate_draft_contents(raw_file_contents)
+                prompt = _build_character_draft_prompt(
+                    draft_locale,
+                    text_context,
+                    truncated_contents,
+                    dropped_tail_count=dropped_tail_count,
+                )
+                raw_text = await sync_to_async(_generate_text)(runtime_config, prompt)
             data = _extract_json_object(raw_text)
             if not data:
                 # Hard fail: the prompt contract is "return ONLY a raw JSON

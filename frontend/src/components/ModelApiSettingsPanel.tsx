@@ -29,6 +29,7 @@ interface ModelConfigFormState {
   modelName: string;
   apiKey: string;
   baseUrl: string;
+  contextWindow: string;
 }
 
 interface WebSearchFormState {
@@ -46,6 +47,7 @@ const EMPTY_FORM: ModelConfigFormState = {
   modelName: DEFAULT_PROJECT_MODEL_NAME,
   apiKey: '',
   baseUrl: '',
+  contextWindow: '',
 };
 
 const EMPTY_WEB_SEARCH_FORM: WebSearchFormState = {
@@ -134,6 +136,7 @@ export default function ModelApiSettingsPanel({
       modelName: config.modelName,
       apiKey: config.apiKey,
       baseUrl: config.baseUrl || '',
+      contextWindow: config.contextWindow ? String(config.contextWindow) : '',
     });
   };
 
@@ -179,12 +182,21 @@ export default function ModelApiSettingsPanel({
     setIsSaving(true);
     setError(null);
 
+    const trimmedContextWindow = formState.contextWindow.trim();
+    const parsedContextWindow = trimmedContextWindow ? Number(trimmedContextWindow) : null;
+    if (parsedContextWindow !== null && (!Number.isFinite(parsedContextWindow) || parsedContextWindow <= 0)) {
+      setError(messages.modelApi.contextWindowInvalid);
+      setIsSaving(false);
+      return;
+    }
+
     const payload = {
       name: formState.name.trim(),
       provider: formState.provider,
       model_name: formState.modelName.trim(),
       api_key: formState.apiKey.trim(),
       base_url: formState.baseUrl.trim(),
+      context_window: parsedContextWindow !== null ? Math.round(parsedContextWindow) : null,
     };
 
     try {
@@ -401,6 +413,11 @@ export default function ModelApiSettingsPanel({
                             </div>
                             <div className="mt-1 text-sm text-slate-500">
                               {config.provider} / {config.modelName}
+                              {config.contextWindow ? (
+                                <span className="ml-2 rounded-full bg-sky-50 px-2 py-0.5 text-xs font-medium text-sky-700">
+                                  {config.contextWindow.toLocaleString()} tokens
+                                </span>
+                              ) : null}
                             </div>
                             {config.baseUrl && (
                               <div className="mt-1 truncate text-xs text-slate-400">{config.baseUrl}</div>
@@ -509,6 +526,19 @@ export default function ModelApiSettingsPanel({
                     {probeState.error && (
                       <p className="mt-1 text-xs text-amber-600">{probeState.error}</p>
                     )}
+                  </div>
+
+                  <div>
+                    <label className="mb-1.5 block text-sm font-medium text-slate-700">{messages.modelApi.contextWindow}</label>
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      value={formState.contextWindow}
+                      onChange={(e) => setFormState((prev) => ({ ...prev, contextWindow: e.target.value.replace(/[^0-9]/g, '') }))}
+                      placeholder={messages.modelApi.contextWindowPlaceholder}
+                      className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+                    />
+                    <p className="mt-1 text-xs text-slate-500">{messages.modelApi.contextWindowHint}</p>
                   </div>
 
                   <div>

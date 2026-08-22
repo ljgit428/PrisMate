@@ -65,6 +65,11 @@ class ModelConfiguration(models.Model):
     model_name = models.CharField(max_length=255)
     api_key = models.CharField(max_length=500, blank=True)
     base_url = models.URLField(max_length=500, blank=True, default="")
+    context_window = models.PositiveBigIntegerField(
+        null=True,
+        blank=True,
+        help_text="Model context window in tokens; powers the accurate context-usage indicator.",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -233,6 +238,11 @@ class CharacterKnowledgeAsset(models.Model):
 
 
 class ChatSession(models.Model):
+    ORIGIN_CHOICES = [
+        ('topic', 'Topic workspace'),
+        ('chat', 'Discord-style chat page'),
+    ]
+
     character = models.ForeignKey(Character, on_delete=models.CASCADE, related_name='chat_sessions')
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='chat_sessions')
     title = models.CharField(max_length=200, blank=True)
@@ -243,6 +253,16 @@ class ChatSession(models.Model):
     is_private_mode = models.BooleanField(
         default=False,
         help_text='Per-session override: when true, the long-term memory pipeline skips writes for turns in this session.',
+    )
+    origin = models.CharField(
+        max_length=10,
+        choices=ORIGIN_CHOICES,
+        default='topic',
+        help_text='Which interface created this session; the two interfaces keep independent session pools.',
+    )
+    is_title_manual = models.BooleanField(
+        default=False,
+        help_text='When true, the auto title generator must not overwrite this title.',
     )
 
     def __str__(self):
@@ -261,6 +281,24 @@ class Message(models.Model):
     timestamp = models.DateTimeField(auto_now_add=True)
     character = models.ForeignKey(Character, on_delete=models.CASCADE, related_name='messages', null=True, blank=True)
     research_payload = models.JSONField(default=dict, blank=True)
+    thinking = models.TextField(
+        blank=True,
+        default="",
+        help_text="Model native reasoning text (e.g. DeepSeek reasoning_content) captured during streaming.",
+    )
+    tool_calls = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="List of {tool, arguments} dicts executed while producing this reply.",
+    )
+    token_usage = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=(
+            "Normalized LLM usage for this reply: "
+            "{prompt_tokens, completion_tokens, total_tokens, cached_tokens}."
+        ),
+    )
     attachment = models.FileField(upload_to='chat_attachments/', blank=True, null=True)
     attachment_name = models.CharField(max_length=255, blank=True, default="")
     attachment_mime_type = models.CharField(max_length=100, blank=True, default="")

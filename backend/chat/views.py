@@ -1,7 +1,5 @@
 import json
-import os
 
-from django.core.files import File
 from django.http import StreamingHttpResponse
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
@@ -45,25 +43,6 @@ from .soul import list_memory_explorer_path, read_memory_explorer_file
 import logging
 
 logger = logging.getLogger(__name__)
-
-
-def _sync_character_primary_reference_file(character):
-    primary_text_asset = character.knowledge_assets.filter(
-        attachment_kind=AttachmentKind.TEXT,
-    ).order_by('sort_order', 'id').first()
-
-    if primary_text_asset and getattr(primary_text_asset, 'file', None):
-        with primary_text_asset.file.open('rb') as source_file:
-            character.file.save(
-                primary_text_asset.attachment_name or os.path.basename(primary_text_asset.file.name or ''),
-                File(source_file),
-                save=False,
-            )
-    elif character.file:
-        character.file.delete(save=False)
-        character.file = None
-
-    character.save(update_fields=['file', 'updated_at'])
 
 
 def _message_serializer(message, request):
@@ -170,7 +149,6 @@ class CharacterViewSet(viewsets.ModelViewSet):
                 )
             )
 
-        _sync_character_primary_reference_file(character)
         serializer = CharacterKnowledgeAssetSerializer(created_assets, many=True, context={'request': request})
         return Response({'assets': serializer.data}, status=status.HTTP_201_CREATED)
 
@@ -184,7 +162,6 @@ class CharacterViewSet(viewsets.ModelViewSet):
 
         asset.file.delete(save=False)
         asset.delete()
-        _sync_character_primary_reference_file(character)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=['get', 'post', 'delete'], url_path='memory')
@@ -436,6 +413,10 @@ class ChatSessionViewSet(viewsets.ModelViewSet):
         if character_id:
             queryset = queryset.filter(character_id=character_id)
 
+        origin = self.request.query_params.get('origin')
+        if origin in dict(ChatSession.ORIGIN_CHOICES):
+            queryset = queryset.filter(origin=origin)
+
         return queryset.order_by('-updated_at')
 
     def perform_create(self, serializer):
@@ -448,14 +429,24 @@ class ChatSessionViewSet(viewsets.ModelViewSet):
 
     def partial_update(self, request, *args, **kwargs):
         """Allow toggling ``is_private_mode`` from the chat composer without
-        sending every other field."""
+        sending every other field. A manually patched ``title`` marks the
+        session so the auto title generator will not overwrite it."""
         instance = self.get_object()
         if 'is_private_mode' in request.data:
             is_private_mode = self._parse_bool(request.data.get('is_private_mode'))
             instance.is_private_mode = is_private_mode
             instance.save(update_fields=['is_private_mode', 'updated_at'])
             return Response(ChatSessionSerializer(instance).data)
-        return super().partial_update(request, *args, **kwargs)
+
+        if 'title' in request.data and (request.data.get('title') or '').strip():
+            # Set the manual flag before the generic update so the auto
+            # generator can never race a just-renamed session.
+            instance.is_title_manual = True
+            instance.save(update_fields=['is_title_manual'])
+
+        super().partial_update(request, *args, **kwargs)
+        instance.refresh_from_db()
+        return Response(ChatSessionSerializer(instance, context={'request': request}).data)
 
     @staticmethod
     def _parse_bool(value):
@@ -704,6 +695,9 @@ class ChatViewSet(viewsets.ViewSet):
         character_id = request.data.get('character_id')
         chat_session_id = request.data.get('chat_session_id')
         start_conversation = self._parse_bool(request.data.get('start_conversation', False))
+        origin = request.data.get('origin')
+        if origin not in dict(ChatSession.ORIGIN_CHOICES):
+            origin = 'topic'
         attachments = list(request.FILES.getlist('attachments'))
         if not attachments:
             legacy_attachment = request.FILES.get('attachment')
@@ -746,6 +740,7 @@ class ChatViewSet(viewsets.ViewSet):
                 user=user,
                 character=character,
                 title=f"Chat with {character.name}",
+                origin=origin,
             )
 
         has_existing_messages = chat_session.messages.exists()

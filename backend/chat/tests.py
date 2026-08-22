@@ -34,6 +34,7 @@ from chat.attachments import (
     guess_attachment_kind,
     validate_attachment_size,
 )
+from chat.memory.filesystem import CharacterMemoryFilesystem, StagedUploadMemoryFilesystem
 from chat.soul import (
     build_character_prompt_context,
     build_character_system_prompt_preview,
@@ -53,7 +54,9 @@ from chat.tasks import (
     _generate_anthropic_response,
     _generate_openai_compatible_response,
     _get_or_upload_generativeai_file,
+    _prepare_generation,
     build_research_context,
+    stream_ai_response,
 )
 
 
@@ -1564,7 +1567,7 @@ class PromptMemoryTests(TestCase):
             messages=[{'role': 'system', 'content': 'Use memory tools.'}],
             base_url='https://example.com/v1',
             tools=_build_memory_tool_specs(),
-            character=self.character,
+            filesystem=CharacterMemoryFilesystem(self.character),
         )
 
         self.assertEqual(result, 'I still call you Gatewalker.')
@@ -1595,7 +1598,7 @@ class PromptMemoryTests(TestCase):
             messages=[{'role': 'system', 'content': 'Use memory tools if available.'}],
             base_url='https://example.com/v1',
             tools=_build_memory_tool_specs(),
-            character=self.character,
+            filesystem=CharacterMemoryFilesystem(self.character),
         )
 
         self.assertEqual(result, 'Fallback answer without tools.')
@@ -2322,11 +2325,37 @@ class CharacterBackgroundUploadTests(ModelConfigTestMixin, TestCase):
         self.assertNotIn('errors', payload)
         self.assertEqual(payload['data']['generateCharacterDraft']['name'], 'Mira')
 
-        _, prompt = mock_generate_text.call_args[0]
-        self.assertIn('Keep the core concept grounded.', prompt)
-        self.assertIn('Name: Mira', prompt)
-        self.assertIn('Mira always answers with calm precision.', prompt)
-        self.assertNotIn('portrait.png', prompt)
+        # The draft must route through the Memory Tools, not inline the file bodies.
+        runtime_config, messages = mock_generate_text.call_args[0]
+        self.assertEqual(runtime_config['provider'], 'openai_compatible')
+        self.assertTrue(mock_generate_text.call_args.kwargs['tools'])
+        filesystem = mock_generate_text.call_args.kwargs['filesystem']
+        self.assertIsInstance(filesystem, StagedUploadMemoryFilesystem)
+
+        prompt_text = '\n'.join(
+            message['content']
+            for message in messages
+            if isinstance(message.get('content'), str)
+        )
+        self.assertIn('Keep the core concept grounded.', prompt_text)
+        # File bodies must NOT be injected into the prompt.
+        self.assertNotIn('Name: Mira', prompt_text)
+        self.assertNotIn('Mira always answers with calm precision.', prompt_text)
+
+        # The files are queryable through the filesystem instead.
+        listing = filesystem.list_memory_files(path_prefix='raw/character_setup/uploads')
+        entries_by_title = {entry['title']: entry for entry in listing['entries']}
+        self.assertIn('profile.txt', entries_by_title)
+        self.assertIn('dialogue.md', entries_by_title)
+        self.assertIn('portrait.png', entries_by_title)
+        self.assertEqual(entries_by_title['portrait.png']['kind'], 'image')
+
+        profile_doc = filesystem.read_memory_file('raw/character_setup/uploads/profile.txt')
+        self.assertIn('Name: Mira', profile_doc['content'])
+
+        portrait_doc = filesystem.read_memory_file('raw/character_setup/uploads/portrait.png')
+        self.assertEqual(portrait_doc['kind'], 'image')
+        self.assertEqual(portrait_doc['content'], '')
 
     def test_create_character_imports_background_text_into_memory_explorer(self):
         background_url = self._write_uploaded_text(
@@ -2358,7 +2387,9 @@ class CharacterBackgroundUploadTests(ModelConfigTestMixin, TestCase):
         self.assertEqual(payload['data']['createCharacter']['backgroundFileName'], 'legacy-dialogue.txt')
 
         character = Character.objects.get(id=payload['data']['createCharacter']['id'])
-        self.assertTrue(character.file.name.startswith('character_files/'))
+        # Character files live in exactly one place: CharacterKnowledgeAsset.
+        # The legacy `Character.file` mirror is no longer written.
+        self.assertFalse(character.file)
         self.assertEqual(CharacterKnowledgeAsset.objects.filter(character=character).count(), 1)
 
         uploaded_doc = read_memory_explorer_file(
@@ -2498,6 +2529,92 @@ class CharacterBackgroundUploadTests(ModelConfigTestMixin, TestCase):
             'raw/character_setup/uploads/dialogue.txt',
         )
         self.assertIn('Stay with me.', background_doc['content'])
+
+    @patch('chat.graphql.schema._generate_text')
+    def test_generate_draft_routes_many_files_through_reduce_pipeline(self, mock_generate_text):
+        """12+ 个文本文件时走 reduce 流水线，产出映射为 PrisMateDraft。"""
+        ModelConfiguration.objects.create(
+            user=self.user,
+            name='Draft Model',
+            provider='openai_compatible',
+            model_name='gpt-4.1-mini',
+            api_key='user-api-key',
+            base_url='https://example.com/v1',
+        )
+
+        urls = []
+        for i in range(13):
+            body = f'圣亚: 这是第 {i} 段的台词\n老师: 明白'
+            urls.append(self._write_uploaded_text(f'episode_{i}.txt', body))
+
+        def fake_generate_text(runtime_config, messages):
+            system = messages[0].get('content') or ''
+            if '角色分析师' in system:
+                # 批笔记
+                return json.dumps({
+                    'batch_summary': '本批对话。',
+                    'citations': [{'file': 'episode_0.txt', 'quote': '这是第 0 段的台词', 'note': '温和'}],
+                    'personality_evidence': ['温和'],
+                    'language_style': ['礼貌'],
+                    'behavior_notes': [],
+                    'emotion_triggers': [],
+                    'relationships': [],
+                })
+            # 合并
+            return json.dumps({
+                'profile_summary': {
+                    'name': '圣亚',
+                    'description': '三句话背景。第二句。第三句。',
+                    'personality': '温和而礼貌。',
+                    'appearance': '银发',
+                    'affiliation': '三一学园',
+                    'tags': ['温和', '三一'],
+                },
+                'dialogue_library': {
+                    '日常': [{'quote': '今天过得如何？', 'file': 'episode_0.txt', 'note': ''}],
+                    '提问': [{'quote': '老师知道这件事吗？', 'file': 'episode_1.txt', 'note': ''}],
+                    '情绪': [],
+                    '命令拒绝': [],
+                    '玩笑': [],
+                },
+                'behavior_samples': [],
+                'evolution': [],
+            })
+        mock_generate_text.side_effect = fake_generate_text
+
+        response = self.graphql(
+            """
+            mutation GenerateDraft($fileUrls: [String!], $textContext: String) {
+              generateCharacterDraft(fileUrls: $fileUrls, textContext: $textContext) {
+                name
+                description
+                personality
+                affiliation
+                tags
+                exampleDialogue
+              }
+            }
+            """,
+            variables={
+                'fileUrls': urls,
+                'textContext': '目标角色名: 圣亚\n[角色简述]: 分析她',
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertNotIn('errors', payload)
+        draft = payload['data']['generateCharacterDraft']
+        self.assertEqual(draft['name'], '圣亚')
+        self.assertEqual(draft['personality'], '温和而礼貌。')
+        self.assertEqual(draft['affiliation'], '三一学园')
+        self.assertEqual(draft['tags'], ['温和', '三一'])
+        self.assertIn('今天过得如何？', draft['exampleDialogue'])
+        self.assertIn('Character: 老师知道这件事吗？', draft['exampleDialogue'])
+
+        # reduce 流水线跑了多批：13 个文件 → main/mid/cameo 分层后分批 + 合并
+        call_count = mock_generate_text.call_count
+        self.assertGreaterEqual(call_count, 3)
 
     @patch('chat.tasks._request_openai_media_analysis', return_value='A young man with a silver pocket watch.')
     def test_provider_messages_include_character_reference_images_via_image_role(self, mock_analysis):
@@ -2960,7 +3077,7 @@ class AnthropicMessageConversionTests(TestCase):
             messages=[{'role': 'user', 'content': 'hi'}],
             base_url='',
             tools=_build_memory_tool_specs(),
-            character=object(),
+            filesystem=object(),
         )
 
         self.assertEqual(result, 'All clear.')
@@ -2982,3 +3099,277 @@ class AnthropicMessageConversionTests(TestCase):
             for block in blocks:
                 if block.get('type') == 'text':
                     self.assertTrue(block['text'])
+
+
+@override_settings(DEV_AUTO_LOGIN_ENABLED=False)
+class StreamingToolAndThinkingEventTests(ModelConfigTestMixin, TestCase):
+    """Tool lines and native reasoning surfaced through the stream protocol."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='stream-tools', password='password123')
+        self.client.force_login(self.user)
+        self.character = Character.objects.create(
+            created_by=self.user,
+            name='Stream Character',
+            avatar_url='',
+            description='A character for stream event tests.',
+            personality='Curious',
+            appearance='Green scarf',
+            scenario='Garden',
+            example_dialogue='',
+            affiliation='Team S',
+            tags=['stream'],
+        )
+        self.session = ChatSession.objects.create(
+            user=self.user,
+            character=self.character,
+            title='Stream Tools Session',
+        )
+
+    def _profile(self, **overrides):
+        profile = UserProfile.get_or_create_for_user(self.user)
+        for key, value in overrides.items():
+            setattr(profile, key, value)
+        profile.save()
+        return profile
+
+    @patch('chat.tasks._build_provider_messages')
+    @patch('chat.tasks._get_runtime_model_config')
+    @patch('chat.tasks._iter_text_chunks')
+    @patch('chat.tasks.build_research_context')
+    @patch('chat.tasks._get_user_profile')
+    def test_stream_ai_response_surfaces_tool_and_thinking_events_and_persists(
+        self, mock_profile, mock_research, mock_chunks, mock_config, mock_build
+    ):
+        mock_profile.return_value = self._profile(default_enable_web_search=False)
+        mock_research.return_value = {'query': '', 'items': [], 'provider': '', 'error': ''}
+        mock_chunks.return_value = iter([
+            {'type': 'tool', 'tool': 'read_memory_file', 'arguments': {'path': 'raw/chat_sessions/session_1/transcript.md'}},
+            {'type': 'thinking', 'content': 'Let me check what happened last time...'},
+            {'type': 'delta', 'content': 'Hello'},
+            {'type': 'delta', 'content': ' there'},
+        ])
+        mock_config.return_value = {
+            'provider': 'openai_compatible',
+            'model_name': 'deepseek-r1',
+            'api_key': 'k',
+            'base_url': '',
+        }
+        mock_build.return_value = (mock_config.return_value, [], [])
+
+        events = list(stream_ai_response(self.session, self.character))
+
+        self.assertEqual(events[0]['type'], 'tool')
+        self.assertEqual(events[0]['tool'], 'read_memory_file')
+        self.assertEqual(events[0]['arguments']['path'], 'raw/chat_sessions/session_1/transcript.md')
+
+        thinking_event = next(event for event in events if event['type'] == 'thinking')
+        self.assertEqual(thinking_event['content'], 'Let me check what happened last time...')
+
+        delta_text = ''.join(event['content'] for event in events if event['type'] == 'delta')
+        self.assertEqual(delta_text, 'Hello there')
+
+        done_event = next(event for event in events if event['type'] == 'done')
+        self.assertEqual(done_event['thinking'], 'Let me check what happened last time...')
+        self.assertEqual(done_event['tool_calls'], [
+            {'tool': 'read_memory_file', 'arguments': {'path': 'raw/chat_sessions/session_1/transcript.md'}},
+        ])
+
+        ai_message = Message.objects.get(id=done_event['message_id'])
+        self.assertEqual(ai_message.thinking, 'Let me check what happened last time...')
+        self.assertEqual(ai_message.tool_calls, [
+            {'tool': 'read_memory_file', 'arguments': {'path': 'raw/chat_sessions/session_1/transcript.md'}},
+        ])
+
+    @patch('chat.tasks._build_provider_messages')
+    @patch('chat.tasks._get_runtime_model_config')
+    @patch('chat.tasks._iter_text_chunks')
+    @patch('chat.tasks.build_research_context')
+    @patch('chat.tasks._build_search_query')
+    @patch('chat.tasks._get_user_profile')
+    def test_stream_ai_response_emits_web_search_tool_event(
+        self, mock_profile, mock_query, mock_research, mock_chunks, mock_config, mock_build
+    ):
+        mock_profile.return_value = self._profile(default_enable_web_search=True)
+        mock_query.return_value = 'best ramen in tokyo'
+        mock_research.return_value = {
+            'query': 'best ramen in tokyo',
+            'items': [{'title': 'x', 'url': 'https://x', 'snippet': 'y'}],
+            'provider': 'tavily',
+            'error': '',
+        }
+        mock_chunks.return_value = iter([{'type': 'delta', 'content': 'Try Ichiran.'}])
+        mock_config.return_value = {
+            'provider': 'openai_compatible',
+            'model_name': 'm',
+            'api_key': 'k',
+            'base_url': '',
+        }
+        mock_build.return_value = (mock_config.return_value, [], [])
+
+        events = list(stream_ai_response(self.session, self.character))
+
+        self.assertEqual(events[0]['type'], 'tool')
+        self.assertEqual(events[0]['tool'], 'web_search')
+        self.assertEqual(events[0]['arguments']['query'], 'best ramen in tokyo')
+        done_event = next(event for event in events if event['type'] == 'done')
+        self.assertEqual(done_event['tool_calls'][0]['tool'], 'web_search')
+
+    @patch('chat.tasks._execute_local_memory_tool', return_value={'entries': []})
+    @patch('chat.tasks.requests.post')
+    def test_openai_tool_loop_emits_tool_and_thinking_events(self, mock_post, _mock_tool):
+        mock_post.return_value.status_code = 200
+        mock_post.return_value.json.side_effect = [
+            {'choices': [{'message': {
+                'role': 'assistant',
+                'content': None,
+                'tool_calls': [{
+                    'id': 'call_1',
+                    'type': 'function',
+                    'function': {'name': 'list_memory_files', 'arguments': '{"path_prefix": "wiki"}'},
+                }],
+            }}]},
+            {'choices': [{'message': {
+                'role': 'assistant',
+                'content': 'All set.',
+                'reasoning_content': 'I should check the wiki first.',
+            }}]},
+        ]
+
+        event_sink = []
+        result = _generate_openai_compatible_response(
+            model_name='deepseek-r1',
+            api_key='k',
+            messages=[{'role': 'user', 'content': 'hi'}],
+            base_url='https://example.com/v1',
+            tools=_build_memory_tool_specs(),
+            filesystem=object(),
+            event_sink=event_sink,
+        )
+
+        self.assertEqual(result, 'All set.')
+        self.assertEqual(event_sink, [
+            {'type': 'tool', 'tool': 'list_memory_files', 'arguments': {'path_prefix': 'wiki'}},
+            {'type': 'thinking', 'content': 'I should check the wiki first.'},
+        ])
+
+    @patch('chat.views.stream_ai_response')
+    def test_stream_message_passes_tool_and_thinking_events_through(self, mock_stream_ai_response):
+        self.create_model_config()
+        mock_stream_ai_response.return_value = iter([
+            {'type': 'tool', 'tool': 'web_search', 'arguments': {'query': 'x'}},
+            {'type': 'thinking', 'content': 'hmm'},
+            {'type': 'delta', 'content': 'Hello'},
+            {
+                'type': 'done',
+                'message_id': 999,
+                'content': 'Hello',
+                'timestamp': '2026-01-01T00:00:00+00:00',
+                'latency_ms': 10,
+                'thinking': 'hmm',
+                'tool_calls': [{'tool': 'web_search', 'arguments': {'query': 'x'}}],
+            },
+        ])
+
+        response = self.client.post(
+            '/api/chat/stream_message/',
+            data=json.dumps({
+                'character_id': self.character.id,
+                'chat_session_id': self.session.id,
+                'message': 'hi',
+            }),
+            content_type='application/json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload_lines = [
+            json.loads(line)
+            for line in b''.join(response.streaming_content).decode('utf-8').splitlines()
+            if line.strip()
+        ]
+        event_types = [line['type'] for line in payload_lines]
+        self.assertEqual(event_types, ['session', 'tool', 'thinking', 'delta', 'done'])
+        self.assertEqual(payload_lines[1]['tool'], 'web_search')
+        self.assertEqual(payload_lines[2]['content'], 'hmm')
+        self.assertEqual(payload_lines[4]['thinking'], 'hmm')
+
+
+@override_settings(DEV_AUTO_LOGIN_ENABLED=False)
+class SharedGenerationConfigTests(TestCase):
+    """Streaming and non-streaming paths share one generation configuration."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='shared-config', password='password123')
+        self.character = Character.objects.create(
+            created_by=self.user,
+            name='Shared Config Character',
+            avatar_url='',
+            description='A character for shared generation config tests.',
+            personality='Even-keeled',
+            appearance='Beige sweater',
+            scenario='Office',
+            example_dialogue='',
+            affiliation='Team C',
+            tags=['shared'],
+        )
+        self.session = ChatSession.objects.create(
+            user=self.user,
+            character=self.character,
+            title='Shared Config Session',
+        )
+
+    @patch('chat.tasks._build_provider_messages')
+    @patch('chat.tasks._build_stream_memory_prefetch', return_value='PREFETCHED MEMORY')
+    @patch('chat.tasks._supports_memory_tool_mode')
+    @patch('chat.tasks._get_runtime_model_config')
+    def test_prepare_generation_uses_prefetch_when_tools_unsupported(
+        self, mock_config, mock_supports, mock_prefetch, mock_build
+    ):
+        mock_config.return_value = {
+            'provider': 'gemini',
+            'model_name': 'gemini-2.5-flash',
+            'api_key': 'k',
+            'base_url': '',
+        }
+        mock_supports.return_value = False
+        mock_build.return_value = (mock_config.return_value, [], [])
+
+        _prepare_generation(self.session, self.character)
+
+        mock_prefetch.assert_called_once()
+        mock_build.assert_called_once_with(
+            chat_session=self.session,
+            character=self.character,
+            generate_greeting=False,
+            research_context=None,
+            allow_memory_tools=False,
+            retrieved_memory='PREFETCHED MEMORY',
+        )
+
+    @patch('chat.tasks._build_provider_messages')
+    @patch('chat.tasks._build_stream_memory_prefetch')
+    @patch('chat.tasks._supports_memory_tool_mode')
+    @patch('chat.tasks._get_runtime_model_config')
+    def test_prepare_generation_uses_tools_when_supported_and_skips_prefetch(
+        self, mock_config, mock_supports, mock_prefetch, mock_build
+    ):
+        mock_config.return_value = {
+            'provider': 'openai_compatible',
+            'model_name': 'gpt-4.1',
+            'api_key': 'k',
+            'base_url': '',
+        }
+        mock_supports.return_value = True
+        mock_build.return_value = (mock_config.return_value, [], [])
+
+        _prepare_generation(self.session, self.character)
+
+        mock_prefetch.assert_not_called()
+        mock_build.assert_called_once_with(
+            chat_session=self.session,
+            character=self.character,
+            generate_greeting=False,
+            research_context=None,
+            allow_memory_tools=True,
+            retrieved_memory='',
+        )

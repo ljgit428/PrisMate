@@ -40,7 +40,17 @@ Sign in → open **Project Settings** → add a model configuration with your AP
 
 ## Features
 
-- Custom character creation (manual form or AI-assisted generation from PDFs/text)
+- Custom character creation (manual form or AI-assisted generation from files)
+- **Character reference files** stored in exactly one place (`CharacterKnowledgeAsset`);
+  the legacy `Character.file` mirror is no longer written
+- **Memory Tools for draft generation** — uploaded files are never inlined into the
+  prompt; the model browses/reads them on demand via `list_memory_files` /
+  `read_memory_file` (OpenAI-compatible / Anthropic)
+- **Reduce pipeline for large uploads** — when 12+ text files are attached,
+  `generateCharacterDraft` runs a tiered map-reduce pipeline
+  (`chat/character_reduce.py`): tier by screen time → batch close-read (main files
+  in full, cameo files as segments) → structured notes with citations → merge into
+  a `PrisMateDraft`-aligned profile
 - Streamed chat with persistent per-session history
 - **Long-term memory** per character, with browse/edit/merge/wipe UI at `/memory`
 - **Private Mode** per session to skip long-term memory writes
@@ -62,6 +72,10 @@ See `backend/chat/urls.py` for the full route map.
 backend/
   prismate/            # Django project (settings, celery, urls)
   chat/                # models, views, serializers, graphql, tasks, soul, memory
+  chat/character_reduce.py   # reduce pipeline (tier → batch notes → merge → PrisMateDraft)
+  chat/memory/filesystem.py  # Memory Tools filesystem backends (character / staged uploads)
+  chat/management/commands/run_character_reduce.py  # run reduce with a user's real model config
+  scripts/             # pure-rules map prototype (character_file_indexer.py) + reduce prototype
 frontend/src/
   app/                 # Next.js routes (/, /create-character, /edit-character/[id], /memory)
   components/          # ChatInterface, ChatWindow, MemoryPanel, SoulPanel, ModelApiSettingsPanel…
